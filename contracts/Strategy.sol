@@ -272,6 +272,13 @@ contract Strategy is BaseStrategy {
         tradesEnabled = true;
     }
 
+    function getSingleSidedDeposit(uint256 amnta, uint256 amntb, uint256 resA, uint256 resB) public view returns(uint256){
+
+        //TODO work out exact amount to swap for single sided deposit
+
+        return amnta.mul(resB).div(resA.add(resB));
+    }
+
     /* ========== MUTATIVE FUNCTIONS ========== */
 
     function prepareReturn(uint256 _debtOutstanding)
@@ -387,7 +394,7 @@ contract Strategy is BaseStrategy {
                 return;
             }
 
-            // uint256 beftmBal = balanceOfBeftm();
+            // 
             // if (beftmBal > 1e7) {
             //     // lazy approach. thank you cheap fantom. lets withdraw
             //     beftm.withdraw();
@@ -398,7 +405,8 @@ contract Strategy is BaseStrategy {
             uint256 beftmB = beftm.balanceOf(lpToken);
 
             uint256 wftmBal = balanceOfWant();
-            uint256 beftmWeNeed = wftmBal.mul(beftmB).div(wftmB.add(beftmB));
+            uint256 beftmBal = balanceOfBeftm();
+            uint256 beftmWeNeed = getSingleSidedDeposit(wftmBal, beftmBal, wftmB,beftmB);
 
             if (beftmWeNeed > 1e7) {
                 //we want to mint some beftm
