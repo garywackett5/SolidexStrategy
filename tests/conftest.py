@@ -57,13 +57,8 @@ def mim():
 
 
 @pytest.fixture(scope="module")
-def boo():
-    yield Contract("0x841FAD6EAe12c286d1Fd18d1d525DFfA75C7EFFE")
-
-
-@pytest.fixture(scope="module")
-def xboo():
-    yield Contract("0xa48d959AE2E88f1dAA7D5F611E01908106dE7598")
+def beftm():
+    yield Contract("0x7381eD41F6dE418DdE5e84B55590422a57917886")
 
 
 @pytest.fixture(scope="module")
@@ -73,19 +68,28 @@ def lpdepositer():
 
 # Define relevant tokens and contracts in this section
 @pytest.fixture(scope="module")
-def token(boo):
-    yield boo
+def token(wftm):
+    yield wftm
 
 
 @pytest.fixture(scope="module")
 def whale(accounts):
-    # Update this with a large holder of your want token (the largest EOA holder of LP)
+    # wftm/tomb pool
     whale = accounts.at(
-        "0x95478C4F7D22D1048F46100001c2C69D2BA57380", force=True)
+        "0x2A651563C9d3Af67aE0388a5c8F89b867038089e", force=True)
     yield whale
 
 
+@pytest.fixture(scope="module")
+def beftm_whale(accounts):
+    # wftm/tomb pool
+    whale = accounts.at(
+        "0x20dd72Ed959b6147912C2e529F0a0C651c33c9ce", force=True)
+    yield whale
+
 # this is the amount of funds we have our whale deposit. adjust this as needed based on their wallet balance
+
+
 @pytest.fixture(scope="module")
 def amount(token):  # use today's exchange rates to have similar $$ amounts
     amount = 5000 * (10 ** token.decimals())
@@ -204,6 +208,16 @@ def vault(pm, gov, rewards, guardian, management, token, chain):
     yield vault
 
 
+@pytest.fixture(scope="function")
+def beftm_vault(pm, beftm, gov, rewards, guardian, management, chain):
+    Vault = pm(config["dependencies"][0]).Vault
+    vault = guardian.deploy(Vault)
+    vault.initialize(beftm, gov, rewards, "", "", guardian)
+    vault.setDepositLimit(2 ** 256 - 1, {"from": gov})
+    vault.setManagement(management, {"from": gov})
+    chain.sleep(1)
+    yield vault
+
 # use this if your vault is already deployed
 # @pytest.fixture(scope="function")
 # def vault(pm, gov, rewards, guardian, management, token, chain):
@@ -218,22 +232,19 @@ def strategy(
     strategist,
     keeper,
     vault,
+    beftm_vault,
     gov,
-    strategy_name,
-    trade_factory,
-    ymechs_safe
+    strategy_name
 ):
     # make sure to include all constructor parameters needed here
     strategy = strategist.deploy(
         Strategy,
         vault,
-        strategy_name
+        strategy_name,
+        beftm_vault
 
     )
-    trade_factory.grantRole(
-        trade_factory.STRATEGY(), strategy, {
-            "from": ymechs_safe, "gas_price": "0 gwei"}
-    )
+
     strategy.setKeeper(keeper, {"from": gov})
     # set our management fee to zero so it doesn't mess with our profit checking
     vault.setManagementFee(0, {"from": gov})

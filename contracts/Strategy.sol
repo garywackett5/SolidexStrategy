@@ -6,7 +6,7 @@ pragma solidity 0.6.12;
 pragma experimental ABIEncoderV2;
 // WFTM-beFTM
 // These are the core Yearn libraries
-import {BaseStrategy, StrategyParams} from "@yearnvaults/contracts/BaseStrategy.sol";
+import {BaseStrategy, StrategyParams, VaultAPI} from "@yearnvaults/contracts/BaseStrategy.sol";
 import {SafeERC20, SafeMath, IERC20, Address} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/math/Math.sol";
 
@@ -28,6 +28,16 @@ interface ISolidlyRouter {
             uint256 amountB,
             uint256 liquidity
         );
+
+    function swapExactTokensForTokensSimple(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenFrom,
+        address tokenTo,
+        bool stable,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
 
     function removeLiquidity(
         address tokenA,
@@ -63,15 +73,12 @@ interface ISolidlyRouter {
 
 interface IWrappedNative is IERC20 {
     function deposit() external payable;
-    function withdraw(uint wad) external;
+
+    function withdraw(uint256 wad) external;
 }
 
 interface IZapbeFTM {
     function depositNative() external payable;
-}
-
-interface ITradeFactory {
-    function enable(address, address) external;
 }
 
 interface ILpDepositer {
@@ -133,32 +140,27 @@ contract Strategy is BaseStrategy {
     bool public tradesEnabled;
     bool public realiseLosses;
     bool public depositerAvoid;
-    address public tradeFactory =
-        address(0xD3f89C21719Ec5961a3E6B0f9bBf9F9b4180E9e9);
 
     // tokens
-    IERC20 internal constant wftm =
-        IERC20(0x21be370D5312f44cB42ce377BC9b8a0cEF1A4C83);
+    IWrappedNative internal constant wftm =
+        IWrappedNative(0x21be370D5312f44cB42ce377BC9b8a0cEF1A4C83);
     IERC20 internal constant beftm =
-        IXboo(0x7381eD41F6dE418DdE5e84B55590422a57917886);
-    IERC20 internal constant sex =
-        IERC20(0xD31Fcd1f7Ba190dBc75354046F6024A9b86014d7);
-    IERC20 internal constant solid =
-        IERC20(0x888EF71766ca594DED1F0FA3AE64eD2941740A20);
+        IERC20(0x7381eD41F6dE418DdE5e84B55590422a57917886);
 
-    uint256 public lpSlippage = 9995; //0.05% slippage allowance
+    VaultAPI public yvault;
+
+    uint256 public lpSlippage = 9990; //0.1% slippage allowance
 
     uint256 immutable DENOMINATOR = 10_000;
-    
+
     uint256 public maxSell; //set to zero for unlimited
 
+    bool public forceLosses;
     bool public useSpirit;
 
     string internal stratName; // we use this for our strategy's name on cloning
     address public lpToken =
         address(0x387a11D161f6855Bd3c801bA6C79Fe9b824Ce1f3); // StableV1 AMM - WFTM/beFTM
-    ILpDepositer public lpDepositer =
-        ILpDepositer(0x26E1A0d851CF28E697870e1b7F053B605C8b060F);
 
     address public lpTokenSpirit =
         address(0xE3D4C22d0543E050a8b3F713899854Ed792fc1bD); // Spirit LP - WFTM/beFTM
@@ -170,12 +172,14 @@ contract Strategy is BaseStrategy {
     uint256 public minHarvestCredit; // if we hit this amount of credit, harvest the strategy
 
     /* ========== CONSTRUCTOR ========== */
+    receive() external payable {}
 
-    constructor(address _vault, string memory _name)
-        public
-        BaseStrategy(_vault)
-    {
-        _initializeStrat(_name);
+    constructor(
+        address _vault,
+        string memory _name,
+        address _beftmYvault
+    ) public BaseStrategy(_vault) {
+        _initializeStrat(_name, _beftmYvault);
     }
 
     /* ========== CLONING ========== */
@@ -183,25 +187,29 @@ contract Strategy is BaseStrategy {
     event Cloned(address indexed clone);
 
     // this is called by our original strategy, as well as any clones
-    function _initializeStrat(string memory _name) internal {
-        
+    function _initializeStrat(string memory _name, address _beftmYvault)
+        internal
+    {
         // initialize variables
         maxReportDelay = 43200; // 1/2 day in seconds, if we hit this then harvestTrigger = True
         healthCheck = address(0xf13Cd6887C62B5beC145e30c38c4938c5E627fe0); // Fantom common health check
 
+        yvault = VaultAPI(_beftmYvault);
+
+        require(yvault.token() == address(beftm));
+
         // set our strategy's name
         stratName = _name;
+        maxSell = 500_000 * 1e18;
 
         // turn off our credit harvest trigger to start with
         minHarvestCredit = type(uint256).max;
 
-        // add approvals on all tokens
-        IERC20(lpToken).approve(address(lpDepositer), type(uint256).max);
-        IERC20(lpToken).approve(address(solidlyRouter), type(uint256).max);
         beftm.approve(address(solidlyRouter), type(uint256).max);
-        wftm.approve(address(wftm), type(uint256).max);
         wftm.approve(address(solidlyRouter), type(uint256).max);
         beftm.approve(address(spiritRouter), type(uint256).max);
+        wftm.approve(address(spiritRouter), type(uint256).max);
+        beftm.approve(address(_beftmYvault), type(uint256).max);
     }
 
     /* ========== VIEWS ========== */
@@ -215,61 +223,48 @@ contract Strategy is BaseStrategy {
         return want.balanceOf(address(this));
     }
 
+    function balanceOfBeftm() public view returns (uint256) {
+        return beftm.balanceOf(address(this));
+    }
+
     // should be worth 1:1 but up to 0.3% swap fees to exit using spiritswap
     function balanceOfBeftmInWant(uint256 beftmAmount)
         public
         view
         returns (uint256)
     {
-        return beftmAmount.mul(9970).div(10000);
+        return beftmAmount.mul(9970).div(DENOMINATOR);
     }
 
-    function balanceOfLPStaked() public view returns (uint256) {
-        return lpDepositer.userBalances(address(this), lpToken);
+    function balanceOfyVault() public view returns (uint256) {
+        return yvault.balanceOf(address(this));
     }
 
-    function balanceOfConstituents(uint256 liquidity)
-        public
-        view
-        returns (uint256 amountWftm, uint256 amountBeftm)
-    {
-        (amountWftm, amountBeftm) = ISolidlyRouter(solidlyRouter)
-            .quoteRemoveLiquidity(
-                address(wftm),
-                address(beftm),
-                true, // stable pool
-                liquidity
-            );
+    function balanceOfyVaultInBeftm() public view returns (uint256) {
+        return yvaultToBeftm(balanceOfyVault());
+    }
+
+    function yvaultToBeftm(uint256 _vaultTokens) public view returns (uint256) {
+        uint256 pps = yvault.pricePerShare();
+        uint256 inWant = _vaultTokens.mul(pps).div(10**yvault.decimals());
+        return inWant;
+    }
+
+    function beftmToYvault(uint256 _beftmAmount) public view returns (uint256) {
+        uint256 pps = yvault.pricePerShare();
+        uint256 inWant = _beftmAmount.mul(10**yvault.decimals()).div(pps);
+        return inWant;
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
-        uint256 lpTokens = balanceOfLPStaked().add(
-            IERC20(lpToken).balanceOf(address(this))
-        );
-
-        (uint256 amountWftmPerLp, uint256 amountBeftmPerLp) = balanceOfConstituents(
-            lpTokens
-        );
+        uint256 _balanceOfyVaultInBeftm = balanceOfyVaultInBeftm();
 
         uint256 balanceOfBeftmInWftm = balanceOfBeftmInWant(
-            amountBeftmPerLp.add(beftm.balanceOf(address(this)))
+            _balanceOfyVaultInBeftm.add(balanceOfBeftm())
         );
 
         // look at our staked tokens and any free tokens sitting in the strategy
-        return balanceOfBeftminWftm.add(balanceOfWant()).add(amountWftmPerLp);
-    }
-
-    function _setUpTradeFactory() internal {
-        //approve and set up trade factory
-        address _tradeFactory = tradeFactory;
-
-        ITradeFactory tf = ITradeFactory(_tradeFactory);
-        sex.safeApprove(_tradeFactory, type(uint256).max);
-        tf.enable(address(sex), address(want));
-
-        solid.safeApprove(_tradeFactory, type(uint256).max);
-        tf.enable(address(solid), address(want));
-        tradesEnabled = true;
+        return balanceOfBeftmInWftm.add(balanceOfWant());
     }
 
     /* ========== MUTATIVE FUNCTIONS ========== */
@@ -283,14 +278,6 @@ contract Strategy is BaseStrategy {
             uint256 _debtPayment
         )
     {
-        if (tradesEnabled == false && tradeFactory != address(0)) {
-            _setUpTradeFactory();
-        }
-        // claim our rewards
-        address[] memory pairs = new address[](1);
-        pairs[0] = address(lpToken);
-        lpDepositer.getReward(pairs);
-
         uint256 assets = estimatedTotalAssets();
         uint256 wantBal = balanceOfWant();
 
@@ -303,7 +290,7 @@ contract Strategy is BaseStrategy {
 
             amountToFree = _profit.add(_debtPayment);
         } else {
-            //loss should never happen. so leave blank. small potential for IP i suppose. lets not record if so and handle manually
+            //loss should never happen. so leave blank. lets not record if so and handle manually
             //dont withdraw either incase we realise losses
             //withdraw with loss
             if (realiseLosses) {
@@ -320,7 +307,18 @@ contract Strategy is BaseStrategy {
 
         //amountToFree > 0 checking (included in the if statement)
         if (wantBal < amountToFree) {
-            liquidatePosition(amountToFree);
+            (, uint256 swapLoss) = liquidatePosition(amountToFree);
+            if (_profit > 0) {
+                //reduce our profit by whatever we lost swapping some money out
+                if (_profit > swapLoss) {
+                    _profit = _profit - swapLoss;
+                    swapLoss = 0;
+                } else {
+                    _profit = 0;
+                    swapLoss = swapLoss - _profit;
+                }
+            }
+            _loss = swapLoss.add(_loss);
 
             uint256 newLoose = want.balanceOf(address(this));
 
@@ -345,107 +343,20 @@ contract Strategy is BaseStrategy {
         }
         // send all of our want tokens to be deposited
         uint256 toInvest = balanceOfWant();
-        // stake only if we have something to stake
-        // dont bother for less than 0.1 wftm
+
         if (toInvest > 1e17) {
-            // because it is a stable pool, lets check slippage by doing a trade against it. if we can swap 1 wftm for less than slippage we gucci
-            route memory wftmToBeftm = route(
-                address(wftm),
-                address(beftm),
-                true
-            );
-            route memory beftmToWftm = route(
-                address(beftm),
-                address(wftm),
-                true
-            );
+            wftm.withdraw(toInvest);
 
-            uint256 inAmount = 1e18;
+            beftmMinter.depositNative{value: address(this).balance}();
 
-            // wftm to beftm
-            route[] memory routes = new route[](1);
-            routes[0] = wftmToBeftm;
-            uint256 amountOut = ISolidlyRouter(solidlyRouter).getAmountsOut(
-                inAmount,
-                routes
-            )[1];
-            // allow 0.05% slippage by default
-            if (amountOut < inAmount.mul(lpSlippage).div(DENOMINATOR)) {
-                // dont do anything because we would be lping into the lp at a bad price
-                return;
-            }
-
-            // beftm to wftm
-            routes[0] = beftmToWftm;
-            amountOut = ISolidlyRouter(solidlyRouter).getAmountsOut(
-                inAmount,
-                routes
-            )[1];
-            // allow 0.05% slippage by default
-            if (amountOut < inAmount.mul(lpSlippage).div(DENOMINATOR)) {
-                // dont do anything because we would be lping into the lp at a bad price
-                return;
-            }
-
-            // uint256 beftmBal = balanceOfBeftm();
-            // if (beftmBal > 1e7) {
-            //     // lazy approach. thank you cheap fantom. lets withdraw
-            //     beftm.withdraw();
-            // }
-
-            //now we get the ratio we need of each token in the lp. this determines how many we need of each
-            uint256 wftmB = wftm.balanceOf(lpToken);
-            uint256 beftmB = beftm.balanceOf(lpToken);
-
-            uint256 wftmBal = balanceOfWant();
-            uint256 beftmWeNeed = wftmBal.mul(beftmB).div(wftmB.add(beftmB));
-
-            if (beftmWeNeed > 1e7) {
-                //we want to mint some beftm
-                beftm.deposit(beftmWeNeed);
-            }
-
-            wftmBal = balanceOfWant();
-            beftmBal = balanceOfAnyWftm();
-
-            if (anyWftmBal > 0 && wftmBal > 0) {
-                // deposit into lp
-                ISolidlyRouter(solidlyRouter).addLiquidity(
-                    address(wftm),
-                    address(anyWFTM),
-                    true,
-                    wftmBal,
-                    anyWftmBal,
-                    0,
-                    0,
-                    address(this),
-                    2**256 - 1
-                );
-            }
+            wftm.deposit{value: address(this).balance}();
         }
-        uint256 lpBalance = IERC20(lpToken).balanceOf(address(this));
 
-        if (lpBalance > 0) {
-            // deposit to lp depositer
-            lpDepositer.deposit(lpToken, lpBalance);
+        uint256 beftmBalance = balanceOfBeftm();
+
+        if (beftmBalance > 0) {
+            yvault.deposit();
         }
-    }
-
-    // returns lp tokens needed to get that amount of wftm
-    function wftmToLpTokens(uint256 amountOfWftmWeWant) public returns (uint256) {
-        // amount of wftm and beftm for 1 lp token
-        (uint256 amountWftmPerLp, uint256 amountBeftmPerLp) = balanceOfConstituents(
-            1e18
-        );
-
-        // 1 lp token is this amount of wftm
-        amountWftmPerLp = amountWftmPerLp.add(balanceOfBeftmInWant(amountBeftmPerLp));
-
-        uint256 lpTokensWeNeed = amountOfWftmWeWant.mul(1e18).div(
-            amountWftmPerLp
-        );
-
-        return lpTokensWeNeed;
     }
 
     function liquidatePosition(uint256 _amountNeeded)
@@ -453,13 +364,6 @@ contract Strategy is BaseStrategy {
         override
         returns (uint256 _liquidatedAmount, uint256 _loss)
     {
-        // if we have loose beftm. liquidate it
-        uint256 beftmBalance = beftm.balanceOf(address(this));
-        if (beftmBalance > 0) {
-            // sell our beftm
-            _sell(beftmBalance);
-        }
-
         uint256 balanceOfWftm = want.balanceOf(address(this));
 
         // if we need more wftm than is already loose in the contract
@@ -468,96 +372,69 @@ contract Strategy is BaseStrategy {
             uint256 amountToFree = _amountNeeded.sub(balanceOfWftm);
 
             // converts this amount into lpTokens
-            uint256 lpTokensNeeded = wftmToLpTokens(amountToFree);
+            //lets assume we can get 1-1 and treat any extra as loss
 
-            uint256 balanceOfLpTokens = IERC20(lpToken).balanceOf(
-                address(this)
-            );
+            uint256 _balanceOfBeftm = balanceOfBeftm();
 
-            if (balanceOfLpTokens < lpTokensNeeded) {
-                uint256 toWithdrawfromSolidex = lpTokensNeeded.sub(
-                    balanceOfLpTokens
+            if (_balanceOfBeftm < amountToFree) {
+                uint256 balOfYv = balanceOfyVault();
+
+                uint256 toWithdrawFromYvault = Math.min(
+                    beftmToYvault(amountToFree - _balanceOfBeftm),
+                    balOfYv
                 );
 
-                uint256 staked = balanceOfLPStaked();
-                lpDepositer.withdraw(
-                    lpToken,
-                    Math.min(toWithdrawfromSolidex, staked)
-                );
+                //need to withdraw from yvault
+                yvault.withdraw(toWithdrawFromYvault);
 
-                balanceOfLpTokens = IERC20(lpToken).balanceOf(address(this));
+                //note we can not get all we ask for from vault
+                _balanceOfBeftm = balanceOfBeftm();
             }
 
-            (uint256 amountWftm, uint256 amountBeftm) = ISolidlyRouter(
-                solidlyRouter
-            ).removeLiquidity(
-                    address(wftm),
-                    address(beftm),
-                    true,
-                    Math.min(lpTokensNeeded, balanceOfLpTokens),
-                    0,
-                    0,
-                    address(this),
-                    type(uint256).max
-                );
+            //should be 1-1
+            uint256 wftm_change = balanceOfWant();
+            _sell(Math.min(_balanceOfBeftm, amountToFree));
+            uint256 beftm_change = _balanceOfBeftm.sub(balanceOfBeftm());
+            wftm_change = balanceOfWant() - wftm_change;
 
-            _sell(beftm.balanceOf(address(this)));
+            //our loss is the difference between beftm change and wftmchange
+            if (beftm_change > wftm_change) {
+                _loss = beftm_change - wftm_change;
+            }
 
             _liquidatedAmount = Math.min(
                 want.balanceOf(address(this)),
                 _amountNeeded
             );
-
-            if (_liquidatedAmount < _amountNeeded) {
-                _loss = _amountNeeded.sub(_liquidatedAmount);
-            }
         } else {
             _liquidatedAmount = _amountNeeded;
         }
     }
 
     function liquidateAllPositions() internal override returns (uint256) {
-        lpDepositer.withdraw(lpToken, balanceOfLPStaked());
-        ISolidlyRouter(solidlyRouter).removeLiquidity(
-            address(wftm),
-            address(beftm),
-            true,
-            IERC20(lpToken).balanceOf(address(this)),
-            0,
-            0,
-            address(this),
-            type(uint256).max
-        );
-        
-        _sell(beftm.balanceOf(address(this)));
+        yvault.withdraw();
 
-        return balanceOfWant();
+        _sell(balanceOfBeftm());
+
+        if (!forceLosses) {
+            require(balanceOfBeftm() == 0, "couldnt liquidate all beftm");
+        }
     }
 
     function prepareMigration(address _newStrategy) internal override {
-        if (!depositerAvoid) {
-            lpDepositer.withdraw(lpToken, balanceOfLPStaked());
+        uint256 yvBalance = balanceOfyVault();
+
+        if (yvBalance > 0) {
+            //send all our yvtokens to new strat
+            IERC20(address(yvault)).safeTransfer(_newStrategy, yvBalance);
         }
 
-        uint256 lpBalance = IERC20(lpToken).balanceOf(address(this));
-
-        if (lpBalance > 0) {
-            IERC20(lpToken).safeTransfer(_newStrategy, lpBalance);
-        }
-
-        uint256 beftmBalance = beftm.balanceOf(address(this));
+        uint256 beftmBalance = balanceOfBeftm();
 
         if (beftmBalance > 0) {
             // send our total balance of beftm to the new strategy
             beftm.transfer(_newStrategy, beftmBalance);
         }
-    }
-
-    function manualWithdraw(address lp, uint256 amount)
-        external
-        onlyEmergencyAuthorized
-    {
-        lpDepositer.withdraw(lp, amount);
     }
 
     function manualSell(uint256 _amount) external onlyEmergencyAuthorized {
@@ -566,8 +443,7 @@ contract Strategy is BaseStrategy {
 
     // sell from beftm to want
     function _sell(uint256 _amount) internal {
-
-        if(maxSell > 0){
+        if (maxSell > 0) {
             _amount = Math.min(maxSell, _amount);
         }
 
@@ -576,16 +452,26 @@ contract Strategy is BaseStrategy {
         beftmTokenPath[0] = address(beftm);
         beftmTokenPath[1] = address(wftm);
 
-        address router = useSpirit? spiritRouter: solidlyRouter;
-
-        // the solidly stable and volatile duplicates is going to mess this up
-        IUniswapV2Router02(router).swapExactTokensForTokens(
-            _amount,
-            uint256(0),
-            beftmTokenPath,
-            address(this),
-            block.timestamp
-        );
+        if (useSpirit) {
+            // the solidly stable and volatile duplicates is going to mess this up
+            IUniswapV2Router02(spiritRouter).swapExactTokensForTokens(
+                _amount,
+                _amount.mul(lpSlippage).div(DENOMINATOR),
+                beftmTokenPath,
+                address(this),
+                block.timestamp
+            );
+        } else {
+            ISolidlyRouter(solidlyRouter).swapExactTokensForTokensSimple(
+                _amount,
+                _amount.mul(lpSlippage).div(DENOMINATOR),
+                address(beftm),
+                address(wftm),
+                true,
+                address(this),
+                block.timestamp
+            );
+        }
     }
 
     function protectedTokens()
@@ -631,32 +517,6 @@ contract Strategy is BaseStrategy {
         returns (uint256)
     {}
 
-    function updateTradeFactory(address _newTradeFactory)
-        external
-        onlyGovernance
-    {
-        if (tradeFactory != address(0)) {
-            _removeTradeFactoryPermissions();
-        }
-
-        tradeFactory = _newTradeFactory;
-        _setUpTradeFactory();
-    }
-
-    function removeTradeFactoryPermissions() external onlyEmergencyAuthorized {
-        _removeTradeFactoryPermissions();
-    }
-
-    function _removeTradeFactoryPermissions() internal {
-        address _tradeFactory = tradeFactory;
-        sex.safeApprove(_tradeFactory, 0);
-
-        solid.safeApprove(_tradeFactory, 0);
-
-        tradeFactory = address(0);
-        tradesEnabled = false;
-    }
-
     /* ========== SETTERS ========== */
 
     ///@notice This allows us to manually harvest with our keeper as needed
@@ -679,12 +539,17 @@ contract Strategy is BaseStrategy {
         realiseLosses = _realiseLoosses;
     }
 
-    //only vault managers can set high slippage
+    //onlyGovernance can set high slippage
     function setLpSlippage(uint256 _slippage, bool _force)
         external
-        onlyVaultManagers
+        onlyGovernance
     {
         _setLpSlippage(_slippage, _force);
+    }
+
+    //only vault managers can set high slippage
+    function setLpSlippage(uint256 _slippage) external onlyEmergencyAuthorized {
+        _setLpSlippage(_slippage, false);
     }
 
     function _setLpSlippage(uint256 _slippage, bool _force) internal {
@@ -701,17 +566,11 @@ contract Strategy is BaseStrategy {
     }
 
     ///@notice set a max sell for illiquid pools
-    function setMaxSell(uint256 _maxSell)
-        external
-        onlyEmergencyAuthorized
-    {
+    function setMaxSell(uint256 _maxSell) external onlyEmergencyAuthorized {
         maxSell = _maxSell;
     }
 
-    function setUseSpirit(bool _useSpirit)
-        external
-        onlyEmergencyAuthorized
-    {
+    function setUseSpirit(bool _useSpirit) external onlyEmergencyAuthorized {
         useSpirit = _useSpirit;
     }
 }
