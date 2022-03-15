@@ -267,6 +267,10 @@ contract Strategy is BaseStrategy {
         return balanceOfBeftmInWftm.add(balanceOfWant());
     }
 
+    function delegatedAssets() public view override returns (uint256) {
+        return vault.strategies(address(this)).totalDebt;
+    }
+
     /* ========== MUTATIVE FUNCTIONS ========== */
 
     function prepareReturn(uint256 _debtOutstanding)
