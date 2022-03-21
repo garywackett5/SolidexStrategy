@@ -12,7 +12,7 @@ def isolation(fn_isolation):
 # this is the name we want to give our strategy
 @pytest.fixture(scope="module")
 def strategy_name():
-    strategy_name = "boo_Xboo_veLp_Solidex"
+    strategy_name = "beftm_accumulator"
     yield strategy_name
 
 
@@ -82,7 +82,7 @@ def whale(accounts):
 
 @pytest.fixture(scope="module")
 def beftm_whale(accounts):
-    # wftm/tomb pool
+    # beetx vault
     whale = accounts.at(
         "0x20dd72Ed959b6147912C2e529F0a0C651c33c9ce", force=True)
     yield whale

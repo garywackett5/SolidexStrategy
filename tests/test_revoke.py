@@ -12,7 +12,6 @@ def test_revoke_strategy_from_vault(
     chain,
     strategy,
     amount,
-    xboo,
 ):
 
     ## deposit to the vault after approving

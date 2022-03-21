@@ -18,7 +18,6 @@ def test_change_debt_with_profit(
     token.approve(vault, 2 ** 256 - 1, {"from": whale})
     vault.deposit(amount, {"from": whale})
     chain.sleep(1)
-    strategy.setDoHealthCheck(False, {"from": gov})
     strategy.harvest({"from": gov})
 
     # sleep long enough to make uniswap v3 happy (need minimum out)
@@ -55,12 +54,10 @@ def test_change_debt_with_profit(
     # check that we've recorded a gain
     assert profit > 0
 
-    # specifically check that our gain is greater than our donation or confirm we're no more than 5 wei off.
-    assert new_params["totalGain"] - prev_params[
-        "totalGain"
-    ] > donation or math.isclose(
-        new_params["totalGain"] - prev_params["totalGain"], donation, abs_tol=5
-    )
+    beftmDiscount = strategy.beftmDiscount()
+
+    # specifically check that our gain is greater than our donation.
+    assert new_params["totalGain"] - prev_params["totalGain"] > donation-(0.0035*amount/2)-(amount*(10_000-beftmDiscount)/10_000)
 
     # check to make sure that our debtRatio is about half of our previous debt
     assert new_params["debtRatio"] == currentDebt / 2

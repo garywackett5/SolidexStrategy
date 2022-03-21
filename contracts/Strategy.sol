@@ -139,7 +139,6 @@ contract Strategy is BaseStrategy {
         0x16327E3FbDaCA3bcF7E38F5Af2599D2DDc33aE52;
     bool public tradesEnabled;
     bool public realiseLosses;
-    bool public depositerAvoid;
 
     // tokens
     IWrappedNative internal constant wftm =
@@ -151,6 +150,8 @@ contract Strategy is BaseStrategy {
 
     uint256 public lpSlippage = 9990; //0.1% slippage allowance
 
+    // 
+    uint256 public beftmDiscount  = 9970;
     uint256 immutable DENOMINATOR = 10_000;
 
     uint256 public maxSell; //set to zero for unlimited
@@ -227,13 +228,15 @@ contract Strategy is BaseStrategy {
         return beftm.balanceOf(address(this));
     }
 
-    // should be worth 1:1 but up to 0.3% swap fees to exit using spiritswap
+    // should be worth 1:1 but there are swap fees to consider when exiting back in wftm (beftmDiscount)
+    // spirit = 0.3% fee
+    // solid = 0.01% fee
     function balanceOfBeftmInWant(uint256 beftmAmount)
         public
         view
         returns (uint256)
     {
-        return beftmAmount.mul(9970).div(DENOMINATOR);
+        return beftmAmount.mul(beftmDiscount).div(DENOMINATOR);
     }
 
     function balanceOfyVault() public view returns (uint256) {
@@ -419,6 +422,8 @@ contract Strategy is BaseStrategy {
         if (!forceLosses) {
             require(balanceOfBeftm() == 0, "couldnt liquidate all beftm");
         }
+
+        return balanceOfWant();
     }
 
     function prepareMigration(address _newStrategy) internal override {
@@ -453,7 +458,6 @@ contract Strategy is BaseStrategy {
         beftmTokenPath[1] = address(wftm);
 
         if (useSpirit) {
-            // the solidly stable and volatile duplicates is going to mess this up
             IUniswapV2Router02(spiritRouter).swapExactTokensForTokens(
                 _amount,
                 _amount.mul(lpSlippage).div(DENOMINATOR),
@@ -509,7 +513,6 @@ contract Strategy is BaseStrategy {
         return false;
     }
 
-    // is this needed?
     function ethToWant(uint256 _amtInWei)
         public
         view
@@ -539,7 +542,7 @@ contract Strategy is BaseStrategy {
         realiseLosses = _realiseLoosses;
     }
 
-    //onlyGovernance can set high slippage
+    // onlyGovernance can set high slippage
     function setLpSlippage(uint256 _slippage, bool _force)
         external
         onlyGovernance
@@ -547,7 +550,7 @@ contract Strategy is BaseStrategy {
         _setLpSlippage(_slippage, _force);
     }
 
-    //only vault managers can set high slippage
+    // only vault managers can set slippage
     function setLpSlippage(uint256 _slippage) external onlyEmergencyAuthorized {
         _setLpSlippage(_slippage, false);
     }
@@ -560,12 +563,14 @@ contract Strategy is BaseStrategy {
         lpSlippage = _slippage;
     }
 
-    // what does this do?
-    function setDepositerAvoid(bool _avoid) external onlyGovernance {
-        depositerAvoid = _avoid;
+    // beftm should be worth 1:1 with wftm, but there are swap fees to consider when exiting (beftmDiscount) 
+    // beftmDiscount is used in estimatedTotalAssets
+    // set a max sell for illiquid pools
+    function setBeftmDiscount(uint256 _beftmDiscount) external onlyGovernance {
+        beftmDiscount = _beftmDiscount;
     }
 
-    ///@notice set a max sell for illiquid pools
+    // set a max sell for illiquid pools
     function setMaxSell(uint256 _maxSell) external onlyEmergencyAuthorized {
         maxSell = _maxSell;
     }

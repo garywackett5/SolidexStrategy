@@ -551,7 +551,6 @@ def test_withdraw_after_donation_8(
     prev_params = vault.strategies(strategy).dict()
     prev_assets = vault.totalAssets()
 
-    currentDebt = vault.strategies(strategy)[2]
     vault.updateStrategyDebtRatio(strategy, 0, {"from": gov})
     assert vault.strategies(strategy)[2] == 0
 
@@ -574,19 +573,28 @@ def test_withdraw_after_donation_8(
 
     # We harvest twice to take profits and then to send the funds to our strategy. This is for our last check below.
     chain.sleep(1)
-
+    print(strategy.estimatedTotalAssets()/1e18)
     # turn off health check since we just took big profit
     strategy.setDoHealthCheck(False, {"from": gov})
+    t1=strategy.harvest({"from": gov})
+    print(t1.events["Harvested"])
+    print(strategy.estimatedTotalAssets()/1e18)
+    # have to do a second harvest to remove the 0.3% that was remaining
+    # it's actually 0.29% (0.30% - 0.01%)
     strategy.setDoHealthCheck(False, {"from": gov})
-    strategy.harvest({"from": gov})
-
+    t1=strategy.harvest({"from": gov})
+    print(t1.events["Harvested"])
+    print(strategy.estimatedTotalAssets()/1e18)
     # check everywhere to make sure we emptied out the strategy
-    assert strategy.estimatedTotalAssets() <= 100
+    # 0.29% of the 0.29% is still in the strategy
+    assert strategy.estimatedTotalAssets() <= 1 * 1e18
     assert token.balanceOf(strategy) == 0
     current_assets = vault.totalAssets()
 
+    beftmDiscount = strategy.beftmDiscount()
+
     # assert that our total assets have gone up or stayed the same when accounting for the donation and withdrawal
-    assert current_assets >= donation - withdrawal + prev_assets
+    assert current_assets >= donation - withdrawal + prev_assets - (0.0035*amount/2) - (amount*(10_000-beftmDiscount)/10_000)
 
     new_params = vault.strategies(strategy).dict()
 
@@ -604,7 +612,7 @@ def test_withdraw_after_donation_8(
     assert profit > 0
 
     # specifically check that our gain is greater than our donation or confirm we're no more than 5 wei off.
-    assert new_params["totalGain"] - prev_params["totalGain"] > donation
+    assert new_params["totalGain"] - prev_params["totalGain"] > donation  - (0.0035*amount/2) - (amount*(10_000-beftmDiscount)/10_000)
 
     # check that we didn't add any more loss, or at least no more than 2 wei
     assert new_params["totalLoss"] == prev_params["totalLoss"] or math.isclose(
